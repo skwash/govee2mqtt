@@ -93,13 +93,20 @@ fn is_empty_state_quirk_device(device: &ServiceDevice) -> bool {
 }
 
 /// Resolve ON/OFF for platform toggle capabilities (not powerSwitch).
-/// Priority: numeric platform value → optimistic cache → H1310/H1370
-/// inference → (H1310/H1370 only) empty-string OFF default.
+/// Priority: numeric platform value → decoded IoT state → optimistic cache →
+/// H1310/H1370 inference → (H1310/H1370 only) empty-string OFF default.
 pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -> Option<bool> {
     if let Some(cap) = device.get_state_capability_by_instance(instance) {
         if let Some(n) = cap.state.pointer("/value").and_then(|v| v.as_i64()) {
             return Some(n != 0);
         }
+    }
+
+    // Decoded IoT notifications are the only source that observes changes
+    // made outside of Home Assistant, so they outrank the optimistic cache
+    // (which only ever reflects commands that we ourselves sent).
+    if let Some(on) = device.iot_toggle_state(instance) {
+        return Some(on);
     }
 
     if let Some(on) = device.get_toggle_capability_state(instance) {

@@ -1,4 +1,7 @@
-use crate::ble::NotifyHumidifierNightlightParams;
+use crate::ble::{
+    NotifyFanState, NotifyHumidifierNightlightParams, NotifyLightToggles, NotifySegmentColors,
+    SegmentColor,
+};
 use crate::commands::serve::POLL_INTERVAL;
 use crate::lan_api::{DeviceColor, DeviceStatus as LanDeviceStatus, LanDevice};
 use crate::platform_api::{
@@ -40,6 +43,15 @@ pub struct Device {
     pub target_humidity_percent: Option<u8>,
     pub humidifier_work_mode: Option<u8>,
     pub humidifier_param_by_mode: HashMap<u8, u8>,
+
+    /// H1310/H1370 fan and light state decoded from IoT notifications.
+    /// These are authoritative: the platform API returns an empty string for
+    /// every one of the corresponding capabilities, so this is the only place
+    /// that reflects changes made outside of Home Assistant.
+    pub fan_state: Option<NotifyFanState>,
+    pub light_toggles: Option<NotifyLightToggles>,
+    /// Uplight RGBIC segment colors, keyed by zero-based segment index.
+    pub segment_colors: HashMap<u8, SegmentColor>,
 
     /// Optimistic mode capability labels when platform API returns empty state
     pub mode_capability_label_by_instance: HashMap<String, String>,
@@ -615,6 +627,49 @@ impl Device {
     pub fn set_toggle_capability_state(&mut self, instance: &str, on: bool) {
         self.toggle_state_by_instance
             .insert(instance.to_string(), on);
+    }
+
+    pub fn set_fan_state(&mut self, state: NotifyFanState) {
+        self.fan_state.replace(state);
+    }
+
+    pub fn set_light_toggles(&mut self, toggles: NotifyLightToggles) {
+        self.light_toggles.replace(toggles);
+    }
+
+    /// Merge a segment color report into the per-segment map. Reports arrive
+    /// as several packets, each carrying a slice of the ring, so they are
+    /// merged rather than replacing the whole map.
+    pub fn set_segment_colors(&mut self, report: &NotifySegmentColors) {
+        let first = report.first_segment();
+        for (offset, segment) in report.segments.iter().enumerate() {
+            let Ok(index) = u8::try_from(first + offset) else {
+                continue;
+            };
+            self.segment_colors.insert(index, *segment);
+        }
+    }
+
+    /// Resolve an H1310/H1370 toggle capability from decoded IoT state.
+    /// Returns `None` when we have not yet seen a report, so that callers
+    /// can fall back to their existing behavior.
+    pub fn iot_toggle_state(&self, instance: &str) -> Option<bool> {
+        match instance {
+            "mainLightToggle" => self.light_toggles.as_ref().map(|t| t.main_light != 0),
+            "backgroundLightToggle" => self.light_toggles.as_ref().map(|t| t.background_light != 0),
+            "fanToggle" => self.fan_state.as_ref().map(|f| f.on != 0),
+            "reverseAirflowToggle" => self.fan_state.as_ref().map(|f| f.reverse != 0),
+            _ => None,
+        }
+    }
+
+    /// The fan speed (1-6) most recently reported over IoT. A speed of zero
+    /// means the device has not reported one yet.
+    pub fn iot_fan_speed(&self) -> Option<u8> {
+        self.fan_state
+            .as_ref()
+            .map(|f| f.speed)
+            .filter(|speed| *speed > 0)
     }
 
     pub fn get_toggle_capability_state(&self, instance: &str) -> Option<bool> {

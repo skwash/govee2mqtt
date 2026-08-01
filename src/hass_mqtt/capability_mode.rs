@@ -11,6 +11,7 @@ use anyhow::{anyhow, Context};
 use async_trait::async_trait;
 use mosquitto_rs::router::{Params, Payload, State};
 use serde::Deserialize;
+use serde_json::json;
 use serde_json::Value as JsonValue;
 
 pub fn mode_capability_display_name(instance: &str) -> String {
@@ -124,6 +125,18 @@ impl EntityInstance for CapabilityModeSelect {
         if let Some(state_cap) = device.get_state_capability_by_instance(&self.instance_name) {
             if let Some(platform_value) = state_cap.state.pointer("/value") {
                 if let Some(label) = mode_label_for_platform_value(cap, platform_value) {
+                    return client.publish(&self.select.state_topic, label).await;
+                }
+            }
+        }
+
+        // H1310/H1370 report no usable platform state for fanSpeedMode, but
+        // do report the live speed over IoT. Prefer that over the optimistic
+        // label, so that speed changes made from the Govee app or the remote
+        // are reflected here.
+        if self.instance_name == "fanSpeedMode" {
+            if let Some(speed) = device.iot_fan_speed() {
+                if let Some(label) = mode_label_for_platform_value(cap, &json!(speed)) {
                     return client.publish(&self.select.state_topic, label).await;
                 }
             }

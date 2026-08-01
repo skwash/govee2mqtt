@@ -442,6 +442,20 @@ async fn run_iot_subscriber(
                                                     mode, param,
                                                 );
                                             }
+                                            GoveeBlePacket::NotifyFanState(fan) => {
+                                                device.set_fan_state(fan);
+                                            }
+                                            GoveeBlePacket::NotifyLightToggles(toggles) => {
+                                                // The main light is the one that the generic
+                                                // light entity controls, so keep the synthesized
+                                                // on/off in step with it.
+                                                state.on = toggles.main_light != 0
+                                                    || toggles.background_light != 0;
+                                                device.set_light_toggles(toggles);
+                                            }
+                                            GoveeBlePacket::NotifySegmentColors(ref segments) => {
+                                                device.set_segment_colors(segments);
+                                            }
                                             GoveeBlePacket::Generic(_) => {
                                                 // Ignore packets that we can't decode
                                             }

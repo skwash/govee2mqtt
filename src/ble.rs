@@ -224,6 +224,35 @@ impl PacketManager {
             g,
             b,
         ));
+        // H1310/H1370 ceiling fans. Govee reports no usable platform-API
+        // state for the fan or for either light, so these notifications are
+        // what keeps Home Assistant in sync with changes made from the Govee
+        // app, the remote, or the pull chain.
+        all_codecs.push(packet!(
+            &["H1310", "H1370"],
+            NotifyFanState,
+            NotifyFanState,
+            0xaa,
+            0x31,
+            on,
+            speed,
+            reverse,
+        ));
+        all_codecs.push(packet!(
+            &["H1310", "H1370"],
+            NotifyLightToggles,
+            NotifyLightToggles,
+            0xaa,
+            0x36,
+            main_light,
+            background_light,
+        ));
+        all_codecs.push(PacketCodec::new(
+            &["H1310", "H1370"],
+            NotifySegmentColors::encode,
+            NotifySegmentColors::decode,
+        ));
+
         all_codecs.push(PacketCodec::new(
             &["Generic:Light"],
             SetSceneCode::encode,
@@ -423,6 +452,89 @@ pub struct SetDevicePower {
     pub on: bool,
 }
 
+/// Fan state reported by the H1310/H1370 ceiling fans (`AA 31 ...`).
+///
+/// The platform API returns an empty string for `fanToggle`, `fanSpeedMode`
+/// and `reverseAirflowToggle` on these devices, so this report is the only
+/// source of truth for the fan, and the only way to observe changes made
+/// outside of Home Assistant (Govee app, remote, pull chain).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NotifyFanState {
+    pub on: u8,
+    /// 1-6, matching the `fanSpeedMode` platform enum.
+    pub speed: u8,
+    pub reverse: u8,
+}
+
+/// Light state reported by the H1310/H1370 ceiling fans (`AA 36 ...`).
+///
+/// These fans have two independent lights: a downward-facing main light
+/// (`mainLightToggle`) and an upward-facing RGBIC ring (`backgroundLightToggle`).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NotifyLightToggles {
+    pub main_light: u8,
+    pub background_light: u8,
+}
+
+/// A single RGBIC segment's brightness and color.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct SegmentColor {
+    pub brightness: u8,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+/// Segment colors reported by the H1310/H1370 uplight ring (`AA A5 ...`).
+///
+/// The ring is divided into 8 addressable segments, reported across multiple
+/// packets of up to 4 segments each. `index` is 1-based, so packet 1 carries
+/// segments 0-3 and packet 2 carries segments 4-7.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NotifySegmentColors {
+    pub index: u8,
+    pub segments: Vec<SegmentColor>,
+}
+
+impl NotifySegmentColors {
+    const SEGMENTS_PER_PACKET: usize = 4;
+
+    /// Zero-based index of the first segment carried by this packet.
+    pub fn first_segment(&self) -> usize {
+        (self.index.saturating_sub(1) as usize) * Self::SEGMENTS_PER_PACKET
+    }
+
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NotifySegmentColors::encode is not implemented");
+    }
+
+    fn decode(data: &[u8]) -> anyhow::Result<GoveeBlePacket> {
+        anyhow::ensure!(data.len() >= 19, "expected >= 19 bytes, got {}", data.len());
+        anyhow::ensure!(
+            data[0] == 0xaa && data[1] == 0xa5,
+            "not an H1310 segment color report"
+        );
+        // A zero index would underflow the segment offset computation, and is
+        // not something the device is expected to send.
+        anyhow::ensure!(data[2] >= 1, "segment report index is 1-based");
+
+        let segments = data[3..19]
+            .chunks_exact(4)
+            .map(|c| SegmentColor {
+                brightness: c[0],
+                r: c[1],
+                g: c[2],
+                b: c[3],
+            })
+            .collect();
+
+        Ok(GoveeBlePacket::NotifySegmentColors(NotifySegmentColors {
+            index: data[2],
+            segments,
+        }))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoveeBlePacket {
     Generic(HexBytes),
@@ -434,6 +546,9 @@ pub enum GoveeBlePacket {
     SetHumidifierMode(SetHumidifierMode),
     NotifyHumidifierAutoMode(HumidifierAutoMode),
     NotifyHumidifierNightlight(NotifyHumidifierNightlightParams),
+    NotifyFanState(NotifyFanState),
+    NotifyLightToggles(NotifyLightToggles),
+    NotifySegmentColors(NotifySegmentColors),
 }
 
 #[derive(Debug)]
@@ -521,6 +636,136 @@ impl GoveeBlePacket {}
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Every frame in these tests was captured from a real H1310 over AWS
+    /// IoT while driving the corresponding capability via the platform API.
+    #[test]
+    fn h1310_fan_state() {
+        // Fan on, speed 6, forward airflow.
+        assert_eq!(
+            MGR.decode_for_sku(
+                "H1310",
+                &[
+                    0xAA, 0x31, 0x01, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9C
+                ]
+            ),
+            GoveeBlePacket::NotifyFanState(NotifyFanState {
+                on: 1,
+                speed: 6,
+                reverse: 0,
+            })
+        );
+
+        // Fan on, speed 1, reverse airflow engaged.
+        assert_eq!(
+            MGR.decode_for_sku(
+                "H1310",
+                &[
+                    0xAA, 0x31, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9A
+                ]
+            ),
+            GoveeBlePacket::NotifyFanState(NotifyFanState {
+                on: 1,
+                speed: 1,
+                reverse: 1,
+            })
+        );
+    }
+
+    /// The two lights are independent: byte 2 is the downward main light,
+    /// byte 3 is the upward-facing RGBIC ring.
+    #[test]
+    fn h1310_light_toggles() {
+        assert_eq!(
+            MGR.decode_for_sku(
+                "H1310",
+                &[
+                    0xAA, 0x36, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D
+                ]
+            ),
+            GoveeBlePacket::NotifyLightToggles(NotifyLightToggles {
+                main_light: 1,
+                background_light: 0,
+            })
+        );
+
+        assert_eq!(
+            MGR.decode_for_sku(
+                "H1310",
+                &[
+                    0xAA, 0x36, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D
+                ]
+            ),
+            GoveeBlePacket::NotifyLightToggles(NotifyLightToggles {
+                main_light: 0,
+                background_light: 1,
+            })
+        );
+    }
+
+    /// The uplight ring reports 8 segments across multiple packets of 4.
+    #[test]
+    fn h1310_segment_colors() {
+        // Packet 1 carries segments 0-3, here all full-brightness red.
+        let decoded = MGR.decode_for_sku(
+            "H1310",
+            &[
+                0xAA, 0xA5, 0x01, 0x64, 0xFF, 0x00, 0x00, 0x64, 0xFF, 0x00, 0x00, 0x64, 0xFF, 0x00,
+                0x00, 0x64, 0xFF, 0x00, 0x00, 0x0E,
+            ],
+        );
+        let GoveeBlePacket::NotifySegmentColors(report) = decoded else {
+            panic!("expected a segment color report, got {decoded:?}");
+        };
+        assert_eq!(report.first_segment(), 0);
+        assert_eq!(report.segments.len(), 4);
+        assert_eq!(
+            report.segments[0],
+            SegmentColor {
+                brightness: 100,
+                r: 0xFF,
+                g: 0,
+                b: 0
+            }
+        );
+
+        // Packet 2 carries segments 4-7, here all full-brightness blue.
+        let decoded = MGR.decode_for_sku(
+            "H1310",
+            &[
+                0xAA, 0xA5, 0x02, 0x64, 0x00, 0x00, 0xFF, 0x64, 0x00, 0x00, 0xFF, 0x64, 0x00, 0x00,
+                0xFF, 0x64, 0x00, 0x00, 0xFF, 0x0D,
+            ],
+        );
+        let GoveeBlePacket::NotifySegmentColors(report) = decoded else {
+            panic!("expected a segment color report, got {decoded:?}");
+        };
+        assert_eq!(report.first_segment(), 4);
+        assert_eq!(
+            report.segments[3],
+            SegmentColor {
+                brightness: 100,
+                r: 0,
+                g: 0,
+                b: 0xFF
+            }
+        );
+    }
+
+    /// The command frames the app sends share the 0x36 opcode but use a
+    /// 0x33 prefix; only the 0xAA status reports must decode as notifications.
+    #[test]
+    fn h1310_ignores_command_echo() {
+        assert!(matches!(
+            MGR.decode_for_sku(
+                "H1310",
+                &[
+                    0x33, 0x36, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05
+                ]
+            ),
+            GoveeBlePacket::Generic(_)
+        ));
+    }
 
     #[test]
     fn packet_manager() {

@@ -122,11 +122,13 @@ pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -
         return Some(false);
     }
 
-    if device.http_device_state.is_some() {
-        return Some(false);
-    }
-
-    None
+    // No platform state at all yet. This is the situation at initial
+    // registration, before the first poll has landed. Returning None here
+    // would publish nothing, leaving the HASS entity `unknown` and rendering
+    // it as force-off/force-on bolt buttons instead of a toggle. These
+    // devices have no meaningful state to report until a poll arrives, so
+    // seed them OFF; the first poll corrects it if it is actually on.
+    Some(false)
 }
 
 /// Infer toggle state for H1310/H1370 when Govee returns empty platform values.
@@ -149,7 +151,11 @@ pub fn inferred_toggle_state(device: &ServiceDevice, instance: &str) -> Option<b
                 .and_then(|v| v.as_i64())
                 .map(|n| n > 0)
         }
-        "reverseAirflowToggle" => None,
+        // Govee reports no usable state for these, and there is nothing else
+        // in the payload to infer them from. They fall through to the
+        // empty-string OFF default so that HASS gets a definite state rather
+        // than rendering the switch as force-off/force-on bolt buttons.
+        "backgroundLightToggle" | "reverseAirflowToggle" => None,
         _ => None,
     }
 }
@@ -281,6 +287,40 @@ mod test {
         assert_eq!(
             resolve_capability_toggle_state(&device, "gradientToggle"),
             None
+        );
+    }
+
+    /// At initial registration no platform state has been fetched yet. The
+    /// quirk devices must still resolve to a definite OFF so that HASS gets a
+    /// state on the topic; otherwise the switch renders as force-off/force-on
+    /// bolt buttons rather than a toggle.
+    #[test]
+    fn quirk_device_without_platform_state_defaults_off() {
+        let device = ServiceDevice::new("H1310", "47:64:F8:9C:BD:BC:DF:4A");
+        assert!(device.http_device_state.is_none());
+
+        for instance in [
+            "fanToggle",
+            "mainLightToggle",
+            "backgroundLightToggle",
+            "reverseAirflowToggle",
+        ] {
+            assert_eq!(
+                resolve_capability_toggle_state(&device, instance),
+                Some(false),
+                "{instance} should seed OFF before the first poll"
+            );
+        }
+    }
+
+    /// The empty-string platform value must resolve to OFF for every H1310
+    /// toggle, including backgroundLightToggle which has no inference rule.
+    #[test]
+    fn background_light_toggle_defaults_off() {
+        let device = h1310_with_platform_state();
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "backgroundLightToggle"),
+            Some(false)
         );
     }
 

@@ -144,6 +144,14 @@ impl HassClient {
         Ok(())
     }
 
+    /// Publish entity state so that it survives a HASS restart.
+    ///
+    /// State topics must be retained: govee2mqtt only pushes state during
+    /// registration and when a poll observes a change, so a HASS that
+    /// subscribes later (restart, entity re-add) would otherwise see nothing
+    /// on the topic and leave the entity `unknown`. An `unknown` MQTT switch
+    /// renders in HASS as a pair of force-off/force-on lightning bolt buttons
+    /// rather than a toggle.
     pub async fn publish<T: AsRef<str> + std::fmt::Display, P: AsRef<[u8]> + std::fmt::Display>(
         &self,
         topic: T,
@@ -151,7 +159,7 @@ impl HassClient {
     ) -> anyhow::Result<()> {
         log::trace!("{topic} -> {payload}");
         self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
+            .publish(topic, payload, QoS::AtMostOnce, true)
             .await?;
         Ok(())
     }
@@ -164,7 +172,7 @@ impl HassClient {
         let payload = serde_json::to_string(&payload)?;
         log::trace!("{topic} -> {payload}");
         self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
+            .publish(topic, payload, QoS::AtMostOnce, true)
             .await?;
         Ok(())
     }
@@ -624,7 +632,9 @@ pub async fn spawn_hass_integration(
     let mqtt_password = args.mqtt_password()?;
     let mqtt_port = args.mqtt_port()?;
 
-    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, false)?;
+    // Retained so that a HASS which subscribes after we have gone away sees
+    // the offline state rather than treating entities as available.
+    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, true)?;
 
     if mqtt_username.is_some() != mqtt_password.is_some() {
         log::error!(

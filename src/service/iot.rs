@@ -227,6 +227,19 @@ impl IotClient {
     }
 }
 
+/// Whether a packet's `onOff` field should be applied to the synthesized
+/// on/off state.
+///
+/// H1310/H1370 ceiling fans keep reporting `onOff=1` (along with a non-zero
+/// brightness and kelvin) after the fixture has been powered off, which would
+/// otherwise leave `powerSwitch` stuck ON in Home Assistant. Those devices
+/// also emit a light report that does track reality, so when we have decoded
+/// one it takes precedence. Devices that send no light report are unaffected
+/// and keep using `onOff` exactly as before.
+fn should_apply_on_off(on_from_light_report: bool) -> bool {
+    !on_from_light_report
+}
+
 pub async fn start_iot_client(
     args: &UndocApiArguments,
     state: StateHandle,
@@ -401,6 +414,14 @@ async fn run_iot_subscriber(
                                     },
                                 };
 
+                                // H1310/H1370 keep reporting onOff=1 (and a
+                                // non-zero brightness/kelvin) after the fixture
+                                // has been powered off, so their light reports
+                                // are the only trustworthy source of on/off.
+                                // Track whether we saw one, so that the generic
+                                // fields below don't clobber it.
+                                let mut on_from_light_report = false;
+
                                 if let Some(v) = packet.state.brightness {
                                     state.brightness = v;
                                     state.on = v != 0;
@@ -446,11 +467,12 @@ async fn run_iot_subscriber(
                                                 device.set_fan_state(fan);
                                             }
                                             GoveeBlePacket::NotifyLightToggles(toggles) => {
-                                                // The main light is the one that the generic
-                                                // light entity controls, so keep the synthesized
-                                                // on/off in step with it.
+                                                // These are light-type devices, so "on" means
+                                                // that one of the two lights is lit. This is
+                                                // what powerSwitch and the light entity report.
                                                 state.on = toggles.main_light != 0
                                                     || toggles.background_light != 0;
+                                                on_from_light_report = true;
                                                 device.set_light_toggles(toggles);
                                             }
                                             GoveeBlePacket::NotifySegmentColors(ref segments) => {
@@ -476,9 +498,11 @@ async fn run_iot_subscriber(
                                 }
 
                                 // Check on/off last, as we can synthesize "on"
-                                // if the other fields are present
+                                // if the other fields are present.
                                 if let Some(on_off) = packet.state.on_off {
-                                    state.on = on_off != 0;
+                                    if should_apply_on_off(on_from_light_report) {
+                                        state.on = on_off != 0;
+                                    }
                                 }
                                 device.set_iot_device_status(state);
                             }
@@ -522,4 +546,23 @@ async fn run_iot_subscriber(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn on_off_applies_without_a_light_report() {
+        // Pre-existing behavior for every other device: onOff is the only
+        // signal we have, so it must still be honored.
+        assert!(should_apply_on_off(false));
+    }
+
+    #[test]
+    fn light_report_wins_over_stale_on_off() {
+        // H1310/H1370 report onOff=1 after being powered off. Their light
+        // report is accurate, so onOff must not clobber it.
+        assert!(!should_apply_on_off(true));
+    }
 }

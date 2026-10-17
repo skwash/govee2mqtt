@@ -17,6 +17,11 @@ pub struct SwitchConfig {
     pub base: EntityConfig,
     pub command_topic: String,
     pub state_topic: String,
+    /// Set when we cannot observe the real state and instead infer it (see
+    /// `resolve_capability_toggle_state`). Tells hass to treat the entity as
+    /// assumed rather than presenting a toggle that implies certainty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimistic: Option<bool>,
 }
 
 impl SwitchConfig {
@@ -50,6 +55,10 @@ impl SwitchConfig {
             },
             command_topic,
             state_topic,
+            // powerSwitch is backed by real LAN/IoT state; only the platform
+            // toggles of empty-state devices are guesses.
+            optimistic: (instance.instance != "powerSwitch" && device.has_empty_platform_state())
+                .then_some(true),
         })
     }
 
@@ -81,20 +90,16 @@ impl CapabilitySwitch {
     }
 }
 
-/// H1310/H1370 ceiling fans report empty platform state for most toggles
-/// (`fanToggle`, `mainLightToggle`, `reverseAirflowToggle`, ...) rather than
-/// omitting the capability or returning a numeric value. Other device
-/// families are not known to exhibit this, so the "default to OFF instead of
-/// leaving the entity unknown" fallbacks below are intentionally scoped to
-/// this family to avoid changing behavior for devices that legitimately mean
-/// "unknown" when they return an empty string.
-fn is_empty_state_quirk_device(device: &ServiceDevice) -> bool {
-    matches!(device.sku.as_str(), "H1310" | "H1370")
-}
-
 /// Resolve ON/OFF for platform toggle capabilities (not powerSwitch).
 /// Priority: numeric platform value → decoded IoT state → optimistic cache →
-/// H1310/H1370 inference → (H1310/H1370 only) empty-string OFF default.
+/// inference → empty-string OFF default.
+///
+/// The last two steps only apply to devices carrying the
+/// `empty_platform_state` quirk (H1310/H1370 ceiling fans): they report an
+/// empty string for `fanToggle`, `mainLightToggle`, `reverseAirflowToggle`
+/// and friends instead of omitting the capability. Everything else keeps the
+/// pre-existing behavior, so a device that legitimately means "unknown" with
+/// an empty string stays unknown rather than being defaulted to OFF.
 pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -> Option<bool> {
     if let Some(cap) = device.get_state_capability_by_instance(instance) {
         if let Some(n) = cap.state.pointer("/value").and_then(|v| v.as_i64()) {
@@ -117,7 +122,7 @@ pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -
         return Some(on);
     }
 
-    if !is_empty_state_quirk_device(device) {
+    if !device.has_empty_platform_state() {
         return None;
     }
 
@@ -140,7 +145,7 @@ pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -
 
 /// Infer toggle state for H1310/H1370 when Govee returns empty platform values.
 pub fn inferred_toggle_state(device: &ServiceDevice, instance: &str) -> Option<bool> {
-    if !is_empty_state_quirk_device(device) || !device.needs_platform_poll() {
+    if !device.has_empty_platform_state() || !device.needs_platform_poll() {
         return None;
     }
 
@@ -328,6 +333,47 @@ mod test {
         assert_eq!(
             resolve_capability_toggle_state(&device, "backgroundLightToggle"),
             Some(false)
+        );
+    }
+
+    fn toggle_capability(instance: &str) -> DeviceCapability {
+        DeviceCapability {
+            kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+            instance: instance.to_string(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        }
+    }
+
+    /// `optimistic` must only be emitted where we actually guess the state.
+    /// Emitting it everywhere would change the discovery payload, and thus
+    /// hass' behavior, for every existing device and switch.
+    #[tokio::test]
+    async fn optimistic_only_for_guessed_switch_state() {
+        let fan = h1310_with_platform_state();
+        let fan_toggle = SwitchConfig::for_device(&fan, &toggle_capability("fanToggle"))
+            .await
+            .unwrap();
+        assert_eq!(fan_toggle.optimistic, Some(true));
+
+        // Backed by real LAN/IoT state even on an empty-state device.
+        let power = SwitchConfig::for_device(&fan, &toggle_capability("powerSwitch"))
+            .await
+            .unwrap();
+        assert_eq!(power.optimistic, None);
+
+        // A device without the quirk keeps its previous payload exactly.
+        let other = ServiceDevice::new("H7131", "some-other-device-id");
+        let other_toggle = SwitchConfig::for_device(&other, &toggle_capability("gradientToggle"))
+            .await
+            .unwrap();
+        assert_eq!(other_toggle.optimistic, None);
+
+        let json = serde_json::to_value(&other_toggle).unwrap();
+        assert!(
+            json.get("optimistic").is_none(),
+            "optimistic must be omitted entirely, got {json:#}"
         );
     }
 

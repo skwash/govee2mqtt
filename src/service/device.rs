@@ -437,10 +437,16 @@ impl Device {
             return true;
         }
 
+        // Devices whose platform state is empty still have to be polled: the
+        // platform API is the only source for their toggle/mode capabilities,
+        // even though the values themselves arrive empty.
+        if self.has_empty_platform_state() {
+            return true;
+        }
+
         let device_type = self.device_type();
         match (device_type, self.sku.as_str()) {
             (_, "H7160") => false,
-            (_, "H1310") | (_, "H1370") => true,
             (DeviceType::Humidifier, _) => true,
             (DeviceType::Light, _) => false,
             (DeviceType::Kettle, _) => true,
@@ -484,6 +490,15 @@ impl Device {
             }
         }
         false
+    }
+
+    /// True when the platform API reports empty strings rather than real
+    /// values for this device's toggle and mode capabilities.
+    /// See `Quirk::empty_platform_state`.
+    pub fn has_empty_platform_state(&self) -> bool {
+        self.resolve_quirk()
+            .map(|q| q.empty_platform_state)
+            .unwrap_or(false)
     }
 
     pub fn resolve_quirk(&self) -> Option<Quirk> {
@@ -541,15 +556,15 @@ impl Device {
     pub fn get_color_temperature_range(&self) -> Option<(u32, u32)> {
         if let Some(quirk) = self.resolve_quirk() {
             if let Some(range) = quirk.color_temp_range {
-                return range.into();
+                return Some(range);
             }
 
             // A quirk that doesn't state a range doesn't mean the device has
             // no color temperature: most quirks simply never spelled one out.
             // The platform metadata is device-specific and authoritative, so
             // prefer it over both the quirk and the LAN guess below. Without
-            // this, e.g. the H1310 quirk hides the 2700-6500K range that
-            // Govee reports, and Home Assistant gets no temperature control.
+            // this, e.g. the H1370 (which has LAN API support) would be given
+            // the generic 2000-9000K guess instead of what Govee reports.
             return self
                 .http_device_info
                 .as_ref()
@@ -707,20 +722,33 @@ mod test {
         assert_eq!(device.name(), "H6127_CE");
     }
 
-    /// The H1310 quirk states no color temperature range of its own, but
-    /// Govee reports 2700-6500K for the device. The quirk must not mask that,
-    /// or Home Assistant is left with no temperature control at all.
+    /// The H1310 reports colorTemperatureK 2700-6500 in its metadata. Before
+    /// the quirk carried a range, `get_color_temperature_range` returned the
+    /// quirk's `None` and hass only ever saw 'rgb'.
     #[test]
-    fn h1310_color_temp_range_falls_back_to_platform_metadata() {
+    fn h1310_reports_color_temperature_range() {
         let mut device = Device::new("H1310", "47:64:F8:9C:BD:BC:DF:4A");
-        assert!(
-            resolve_quirk("H1310").is_some_and(|q| q.color_temp_range.is_none()),
-            "test assumes the H1310 quirk states no range"
-        );
-
         device.http_device_info =
             Some(from_json(include_str!("../../test-data/h1310_platform_metadata.json")).unwrap());
+        assert_eq!(device.get_color_temperature_range(), Some((2700, 6500)));
+    }
 
+    /// A quirk without a range must fall through to the device's own
+    /// metadata instead of vetoing color temperature outright.
+    #[test]
+    fn quirk_without_range_falls_through_to_metadata() {
+        // H7160 has a quirk but no color_temp_range, and no metadata here,
+        // so nothing can be resolved -- the point is that it does not panic
+        // and does not report a bogus range.
+        let device = Device::new("H7160", "aa:bb");
+        assert_eq!(device.get_color_temperature_range(), None);
+
+        // H1370's quirk states no range; its metadata (borrowed from the
+        // H1310 fixture here) must be what gets reported.
+        assert!(resolve_quirk("H1370").is_some_and(|q| q.color_temp_range.is_none()));
+        let mut device = Device::new("H1370", "aa:bb");
+        device.http_device_info =
+            Some(from_json(include_str!("../../test-data/h1310_platform_metadata.json")).unwrap());
         assert_eq!(device.get_color_temperature_range(), Some((2700, 6500)));
     }
 

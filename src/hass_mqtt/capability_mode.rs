@@ -97,6 +97,9 @@ impl CapabilityModeSelect {
                 command_topic,
                 state_topic,
                 options,
+                // These devices report an empty platform value for the mode,
+                // so the shown option is whatever we last sent.
+                optimistic: device.has_empty_platform_state().then_some(true),
             },
             device_id: device.id.to_string(),
             state: state.clone(),

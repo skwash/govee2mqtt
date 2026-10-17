@@ -645,9 +645,7 @@ mod test {
         assert_eq!(
             MGR.decode_for_sku(
                 "H1310",
-                &[
-                    0xAA, 0x31, 0x01, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9C
-                ]
+                &[0xAA, 0x31, 0x01, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9C]
             ),
             GoveeBlePacket::NotifyFanState(NotifyFanState {
                 on: 1,
@@ -660,9 +658,7 @@ mod test {
         assert_eq!(
             MGR.decode_for_sku(
                 "H1310",
-                &[
-                    0xAA, 0x31, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9A
-                ]
+                &[0xAA, 0x31, 0x01, 0x01, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9A]
             ),
             GoveeBlePacket::NotifyFanState(NotifyFanState {
                 on: 1,
@@ -679,9 +675,7 @@ mod test {
         assert_eq!(
             MGR.decode_for_sku(
                 "H1310",
-                &[
-                    0xAA, 0x36, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D
-                ]
+                &[0xAA, 0x36, 0x01, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D]
             ),
             GoveeBlePacket::NotifyLightToggles(NotifyLightToggles {
                 main_light: 1,
@@ -692,9 +686,7 @@ mod test {
         assert_eq!(
             MGR.decode_for_sku(
                 "H1310",
-                &[
-                    0xAA, 0x36, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D
-                ]
+                &[0xAA, 0x36, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x9D]
             ),
             GoveeBlePacket::NotifyLightToggles(NotifyLightToggles {
                 main_light: 0,
@@ -759,9 +751,7 @@ mod test {
         assert!(matches!(
             MGR.decode_for_sku(
                 "H1310",
-                &[
-                    0x33, 0x36, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05
-                ]
+                &[0x33, 0x36, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05]
             ),
             GoveeBlePacket::Generic(_)
         ));

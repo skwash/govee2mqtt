@@ -1,3 +1,5 @@
+use anyhow::Context;
+
 use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
 use crate::hass_mqtt::instance::{publish_entity_config, EntityInstance};
 use crate::platform_api::DeviceType;
@@ -62,7 +64,7 @@ pub struct DeviceLight {
 #[async_trait]
 impl EntityInstance for DeviceLight {
     async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
-        self.light.publish(&state, &client).await
+        self.light.publish(state, client).await
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
@@ -155,19 +157,22 @@ impl DeviceLight {
         let unique_id = format!(
             "gv2mqtt-{id}{seg}",
             id = topic_safe_id(device),
-            seg = segment.map(|n| format!("-{n}")).unwrap_or(String::new())
+            seg = segment.map(|n| format!("-{n}")).unwrap_or_default()
         );
 
         let effect_list = if segment.is_some() {
             vec![]
         } else {
-            match state.device_list_scenes(device).await {
-                Ok(scenes) => scenes,
-                Err(err) => {
-                    log::error!("Unable to list scenes for {device}: {err:#}");
-                    vec![]
-                }
-            }
+            // Deliberately propagate instead of falling back to an empty
+            // list. Discovery is published with retain=false, so an empty
+            // effect_list would actively overwrite the effects hass already
+            // knows about, and a transient scene-API timeout would wipe them
+            // from the UI. Failing here leaves the previously published
+            // config in place.
+            state
+                .device_list_scenes(device)
+                .await
+                .with_context(|| format!("listing scenes for {device}"))?
         };
 
         let mut supported_color_modes = vec![];

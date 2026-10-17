@@ -1,3 +1,4 @@
+use crate::hass_mqtt::capability_mode::mqtt_capability_mode_command;
 use crate::hass_mqtt::climate::mqtt_set_temperature;
 use crate::hass_mqtt::enumerator::{enumerate_all_entites, enumerate_entities_for_device};
 use crate::hass_mqtt::humidifier::{mqtt_device_set_work_mode, mqtt_humidifier_set_target};
@@ -143,6 +144,14 @@ impl HassClient {
         Ok(())
     }
 
+    /// Publish entity state so that it survives a HASS restart.
+    ///
+    /// State topics must be retained: govee2mqtt only pushes state during
+    /// registration and when a poll observes a change, so a HASS that
+    /// subscribes later (restart, entity re-add) would otherwise see nothing
+    /// on the topic and leave the entity `unknown`. An `unknown` MQTT switch
+    /// renders in HASS as a pair of force-off/force-on lightning bolt buttons
+    /// rather than a toggle.
     pub async fn publish<T: AsRef<str> + std::fmt::Display, P: AsRef<[u8]> + std::fmt::Display>(
         &self,
         topic: T,
@@ -150,7 +159,7 @@ impl HassClient {
     ) -> anyhow::Result<()> {
         log::trace!("{topic} -> {payload}");
         self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
+            .publish(topic, payload, QoS::AtMostOnce, true)
             .await?;
         Ok(())
     }
@@ -163,7 +172,7 @@ impl HassClient {
         let payload = serde_json::to_string(&payload)?;
         log::trace!("{topic} -> {payload}");
         self.client
-            .publish(topic, payload, QoS::AtMostOnce, false)
+            .publish(topic, payload, QoS::AtMostOnce, true)
             .await?;
         Ok(())
     }
@@ -371,7 +380,7 @@ async fn mqtt_light_segment_command(
 
         if let Some(brightness) = command.brightness {
             client
-                .set_segment_brightness(&info, segment, brightness)
+                .set_segment_brightness(info, segment, brightness)
                 .await?;
         } else if command.state == "OFF" {
             // Do nothing here. We used to set brightness to zero,
@@ -385,7 +394,7 @@ async fn mqtt_light_segment_command(
         }
         if let Some(color) = &command.color {
             client
-                .set_segment_rgb(&info, segment, color.r, color.g, color.b)
+                .set_segment_rgb(info, segment, color.r, color.g, color.b)
                 .await?;
         }
     } else {
@@ -428,7 +437,7 @@ async fn mqtt_oneclick(
         .await
         .ok_or_else(|| anyhow::anyhow!("AWS IoT client is not available"))?;
 
-    iot.activate_one_click(&item).await
+    iot.activate_one_click(item).await
 }
 
 #[derive(Deserialize)]
@@ -453,33 +462,21 @@ async fn mqtt_switch_command(
 
     if instance == "powerSwitch" {
         state.device_power_on(&device, on).await?;
-    } else if let Some(client) = state.get_platform_client().await {
-        if let Some(http_dev) = &device.http_device_info {
-            client.set_toggle_state(http_dev, &instance, on).await?;
-        } else {
-            anyhow::bail!("No platform state available to set {id} {instance} to {on}");
-        }
     } else {
-        anyhow::bail!("Don't know how to {command} for {id} {instance}!");
+        state
+            .device_set_toggle_capability(&device, &instance, on)
+            .await?;
     }
 
     Ok(())
 }
 
 pub fn mired_to_kelvin(mired: u32) -> u32 {
-    if mired == 0 {
-        0
-    } else {
-        1000000 / mired
-    }
+    1_000_000u32.checked_div(mired).unwrap_or(0)
 }
 
 pub fn kelvin_to_mired(kelvin: u32) -> u32 {
-    if kelvin == 0 {
-        0
-    } else {
-        1000000 / kelvin
-    }
+    1_000_000u32.checked_div(kelvin).unwrap_or(0)
 }
 
 /// HASS is advising us that its status has changed
@@ -532,6 +529,12 @@ async fn run_mqtt_loop(
         router
             .route("gv2mqtt/switch/:id/command/:instance", mqtt_switch_command)
             .await?;
+        router
+            .route(
+                "gv2mqtt/select/:id/command/:instance",
+                mqtt_capability_mode_command,
+            )
+            .await?;
 
         router.route(oneclick_topic(), mqtt_oneclick).await?;
         router.route(purge_cache_topic(), mqtt_purge_caches).await?;
@@ -574,7 +577,7 @@ async fn run_mqtt_loop(
             .get_hass_client()
             .await
             .expect("have hass client")
-            .register_with_hass(&state)
+            .register_with_hass(state)
             .await
             .context("register_with_hass")?;
 
@@ -629,7 +632,9 @@ pub async fn spawn_hass_integration(
     let mqtt_password = args.mqtt_password()?;
     let mqtt_port = args.mqtt_port()?;
 
-    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, false)?;
+    // Retained so that a HASS which subscribes after we have gone away sees
+    // the offline state rather than treating entities as available.
+    client.set_last_will(availability_topic(), "offline", QoS::AtMostOnce, true)?;
 
     if mqtt_username.is_some() != mqtt_password.is_some() {
         log::error!(
@@ -696,8 +701,12 @@ pub async fn spawn_hass_integration(
 }
 
 pub fn camel_case_to_space_separated(camel: &str) -> String {
-    let mut result = camel[..1].to_ascii_uppercase();
-    for c in camel.chars().skip(1) {
+    let mut chars = camel.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut result = first.to_ascii_uppercase().to_string();
+    for c in chars {
         if c.is_uppercase() {
             result.push(' ');
         }
@@ -707,11 +716,33 @@ pub fn camel_case_to_space_separated(camel: &str) -> String {
 }
 
 #[cfg(test)]
-#[test]
-fn test_camel_case_to_space_separated() {
-    assert_eq!(camel_case_to_space_separated("powerSwitch"), "Power Switch");
-    assert_eq!(
-        camel_case_to_space_separated("oscillationToggle"),
-        "Oscillation Toggle"
-    );
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_camel_case_to_space_separated() {
+        assert_eq!(camel_case_to_space_separated("powerSwitch"), "Power Switch");
+        assert_eq!(
+            camel_case_to_space_separated("oscillationToggle"),
+            "Oscillation Toggle"
+        );
+    }
+
+    #[test]
+    fn test_camel_case_chinese_no_panic() {
+        assert_eq!(
+            camel_case_to_space_separated("用于三灯头中的第二个"),
+            "用于三灯头中的第二个"
+        );
+    }
+
+    #[test]
+    fn test_camel_case_empty() {
+        assert_eq!(camel_case_to_space_separated(""), "");
+    }
+
+    #[test]
+    fn test_camel_case_emoji() {
+        assert_eq!(camel_case_to_space_separated("🔥lightMode"), "🔥light Mode");
+    }
 }

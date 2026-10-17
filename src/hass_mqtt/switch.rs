@@ -17,6 +17,11 @@ pub struct SwitchConfig {
     pub base: EntityConfig,
     pub command_topic: String,
     pub state_topic: String,
+    /// Set when we cannot observe the real state and instead infer it (see
+    /// `resolve_capability_toggle_state`). Tells hass to treat the entity as
+    /// assumed rather than presenting a toggle that implies certainty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimistic: Option<bool>,
 }
 
 impl SwitchConfig {
@@ -50,6 +55,10 @@ impl SwitchConfig {
             },
             command_topic,
             state_topic,
+            // powerSwitch is backed by real LAN/IoT state; only the platform
+            // toggles of empty-state devices are guesses.
+            optimistic: (instance.instance != "powerSwitch" && device.has_empty_platform_state())
+                .then_some(true),
         })
     }
 
@@ -81,10 +90,100 @@ impl CapabilitySwitch {
     }
 }
 
+/// Resolve ON/OFF for platform toggle capabilities (not powerSwitch).
+/// Priority: numeric platform value → decoded IoT state → optimistic cache →
+/// inference → empty-string OFF default.
+///
+/// The last two steps only apply to devices carrying the
+/// `empty_platform_state` quirk (H1310/H1370 ceiling fans): they report an
+/// empty string for `fanToggle`, `mainLightToggle`, `reverseAirflowToggle`
+/// and friends instead of omitting the capability. Everything else keeps the
+/// pre-existing behavior, so a device that legitimately means "unknown" with
+/// an empty string stays unknown rather than being defaulted to OFF.
+pub fn resolve_capability_toggle_state(device: &ServiceDevice, instance: &str) -> Option<bool> {
+    if let Some(cap) = device.get_state_capability_by_instance(instance) {
+        if let Some(n) = cap.state.pointer("/value").and_then(|v| v.as_i64()) {
+            return Some(n != 0);
+        }
+    }
+
+    // Decoded IoT notifications are the only source that observes changes
+    // made outside of Home Assistant, so they outrank the optimistic cache
+    // (which only ever reflects commands that we ourselves sent).
+    if let Some(on) = device.iot_toggle_state(instance) {
+        return Some(on);
+    }
+
+    if let Some(on) = device.get_toggle_capability_state(instance) {
+        return Some(on);
+    }
+
+    if let Some(on) = inferred_toggle_state(device, instance) {
+        return Some(on);
+    }
+
+    if !device.has_empty_platform_state() {
+        return None;
+    }
+
+    if let Some(cap) = device.get_state_capability_by_instance(instance) {
+        if cap.state.pointer("/value") == Some(&json!("")) {
+            return Some(false);
+        }
+        log::warn!("CapabilitySwitch: unhandled platform state for {instance}: {cap:#?}");
+        return Some(false);
+    }
+
+    // No platform state at all yet. This is the situation at initial
+    // registration, before the first poll has landed. Returning None here
+    // would publish nothing, leaving the HASS entity `unknown` and rendering
+    // it as force-off/force-on bolt buttons instead of a toggle. These
+    // devices have no meaningful state to report until a poll arrives, so
+    // seed them OFF; the first poll corrects it if it is actually on.
+    Some(false)
+}
+
+/// Infer toggle state for H1310/H1370 when Govee returns empty platform values.
+pub fn inferred_toggle_state(device: &ServiceDevice, instance: &str) -> Option<bool> {
+    if !device.has_empty_platform_state() || !device.needs_platform_poll() {
+        return None;
+    }
+
+    match instance {
+        "mainLightToggle" => device
+            .device_state()
+            .map(|state| state.brightness > 0 || state.on),
+        "fanToggle" => {
+            if device.get_mode_capability_label("fanSpeedMode").is_some() {
+                return Some(true);
+            }
+            device
+                .get_state_capability_by_instance("fanSpeedMode")
+                .and_then(|cap| cap.state.pointer("/value"))
+                .and_then(|v| v.as_i64())
+                .map(|n| n > 0)
+        }
+        // Govee reports no usable state for these, and there is nothing else
+        // in the payload to infer them from. They fall through to the
+        // empty-string OFF default so that HASS gets a definite state rather
+        // than rendering the switch as force-off/force-on bolt buttons.
+        "backgroundLightToggle" | "reverseAirflowToggle" => None,
+        _ => None,
+    }
+}
+
+fn toggle_mqtt_payload(on: bool) -> &'static str {
+    if on {
+        "ON"
+    } else {
+        "OFF"
+    }
+}
+
 #[async_trait]
 impl EntityInstance for CapabilitySwitch {
     async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
-        self.switch.publish(&state, &client).await
+        self.switch.publish(state, client).await
     }
 
     async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
@@ -97,48 +196,202 @@ impl EntityInstance for CapabilitySwitch {
         if self.instance_name == "powerSwitch" {
             if let Some(state) = device.device_state() {
                 client
-                    .publish(
-                        &self.switch.state_topic,
-                        if state.on { "ON" } else { "OFF" },
-                    )
+                    .publish(&self.switch.state_topic, toggle_mqtt_payload(state.on))
                     .await?;
             }
             return Ok(());
         }
 
-        // TODO: currently, Govee don't return any meaningful data on
-        // additional states. When they do, we'll need to start reporting
-        // it here, but we'll also need to start polling it from the
-        // platform API in order for it to even be available here.
-        // Until then, the switch will show in the hass UI with an
-        // unknown state but provide you with separate on and off push
-        // buttons so that you can at least send the commands to the device.
-        // <https://developer.govee.com/discuss/6596e84c901fb900312d5968>
-
-        if let Some(cap) = device.get_state_capability_by_instance(&self.instance_name) {
-            match cap.state.pointer("/value").and_then(|v| v.as_i64()) {
-                Some(n) => {
-                    return client
-                        .publish(&self.switch.state_topic, if n != 0 { "ON" } else { "OFF" })
-                        .await;
-                }
-                None => {
-                    if cap.state.pointer("/value") == Some(&json!("")) {
-                        log::trace!(
-                            "CapabilitySwitch::notify_state ignore useless \
-                                            empty string state for {cap:?}"
-                        );
-                    } else {
-                        log::warn!("CapabilitySwitch::notify_state: Do something with {cap:#?}");
-                    }
-                    return Ok(());
-                }
-            }
+        if let Some(on) = resolve_capability_toggle_state(&device, &self.instance_name) {
+            return client
+                .publish(&self.switch.state_topic, toggle_mqtt_payload(on))
+                .await;
         }
+
         log::trace!(
-            "CapabilitySwitch::notify_state: didn't find state for {device} {instance}",
+            "CapabilitySwitch::notify_state: no state for {device} {instance}",
             instance = self.instance_name
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::platform_api::{from_json, HttpDeviceState};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct StateFixture {
+        payload: HttpDeviceState,
+    }
+
+    fn h1310_with_platform_state() -> ServiceDevice {
+        let mut device = ServiceDevice::new("H1310", "47:64:F8:9C:BD:BC:DF:4A");
+        let fixture: StateFixture =
+            from_json(include_str!("../../test-data/h1310_platform_state.json")).unwrap();
+        device.set_http_device_state(fixture.payload);
+        device
+    }
+
+    #[test]
+    fn empty_platform_toggle_defaults_off() {
+        let device = h1310_with_platform_state();
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "fanToggle"),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "reverseAirflowToggle"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn optimistic_toggle_state() {
+        let mut device = h1310_with_platform_state();
+        device.set_toggle_capability_state("fanToggle", true);
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "fanToggle"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn inferred_main_light_from_brightness() {
+        let device = h1310_with_platform_state();
+        assert_eq!(
+            inferred_toggle_state(&device, "mainLightToggle"),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn inferred_fan_from_mode_label() {
+        let mut device = h1310_with_platform_state();
+        device.set_mode_capability_label("fanSpeedMode", "Speed 3".to_string());
+        assert_eq!(inferred_toggle_state(&device, "fanToggle"), Some(true));
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "fanToggle"),
+            Some(true)
+        );
+    }
+
+    /// Non-H1310/H1370 devices must keep the pre-existing behavior: an
+    /// empty-string platform value (Govee's "no meaningful data yet" state)
+    /// leaves the entity state unresolved (`None`, reported as "unknown" in
+    /// HA) instead of being defaulted to OFF. Only the H1310/H1370 family
+    /// has the empty-state quirk that justifies the OFF fallback.
+    #[test]
+    fn non_h1310_empty_platform_toggle_stays_unknown() {
+        let mut device = ServiceDevice::new("H7131", "some-other-device-id");
+        device.set_http_device_state(HttpDeviceState {
+            sku: "H7131".to_string(),
+            device: "some-other-device-id".to_string(),
+            capabilities: vec![crate::platform_api::DeviceCapabilityState {
+                kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+                instance: "gradientToggle".to_string(),
+                state: json!({ "value": "" }),
+            }],
+        });
+
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "gradientToggle"),
+            None
+        );
+    }
+
+    /// At initial registration no platform state has been fetched yet. The
+    /// quirk devices must still resolve to a definite OFF so that HASS gets a
+    /// state on the topic; otherwise the switch renders as force-off/force-on
+    /// bolt buttons rather than a toggle.
+    #[test]
+    fn quirk_device_without_platform_state_defaults_off() {
+        let device = ServiceDevice::new("H1310", "47:64:F8:9C:BD:BC:DF:4A");
+        assert!(device.http_device_state.is_none());
+
+        for instance in [
+            "fanToggle",
+            "mainLightToggle",
+            "backgroundLightToggle",
+            "reverseAirflowToggle",
+        ] {
+            assert_eq!(
+                resolve_capability_toggle_state(&device, instance),
+                Some(false),
+                "{instance} should seed OFF before the first poll"
+            );
+        }
+    }
+
+    /// The empty-string platform value must resolve to OFF for every H1310
+    /// toggle, including backgroundLightToggle which has no inference rule.
+    #[test]
+    fn background_light_toggle_defaults_off() {
+        let device = h1310_with_platform_state();
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "backgroundLightToggle"),
+            Some(false)
+        );
+    }
+
+    fn toggle_capability(instance: &str) -> DeviceCapability {
+        DeviceCapability {
+            kind: crate::platform_api::DeviceCapabilityKind::Toggle,
+            instance: instance.to_string(),
+            parameters: None,
+            alarm_type: None,
+            event_state: None,
+        }
+    }
+
+    /// `optimistic` must only be emitted where we actually guess the state.
+    /// Emitting it everywhere would change the discovery payload, and thus
+    /// hass' behavior, for every existing device and switch.
+    #[tokio::test]
+    async fn optimistic_only_for_guessed_switch_state() {
+        let fan = h1310_with_platform_state();
+        let fan_toggle = SwitchConfig::for_device(&fan, &toggle_capability("fanToggle"))
+            .await
+            .unwrap();
+        assert_eq!(fan_toggle.optimistic, Some(true));
+
+        // Backed by real LAN/IoT state even on an empty-state device.
+        let power = SwitchConfig::for_device(&fan, &toggle_capability("powerSwitch"))
+            .await
+            .unwrap();
+        assert_eq!(power.optimistic, None);
+
+        // A device without the quirk keeps its previous payload exactly.
+        let other = ServiceDevice::new("H7131", "some-other-device-id");
+        let other_toggle = SwitchConfig::for_device(&other, &toggle_capability("gradientToggle"))
+            .await
+            .unwrap();
+        assert_eq!(other_toggle.optimistic, None);
+
+        let json = serde_json::to_value(&other_toggle).unwrap();
+        assert!(
+            json.get("optimistic").is_none(),
+            "optimistic must be omitted entirely, got {json:#}"
+        );
+    }
+
+    #[test]
+    fn numeric_platform_toggle() {
+        let mut device = h1310_with_platform_state();
+        let cap = device
+            .http_device_state
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .iter_mut()
+            .find(|c| c.instance == "fanToggle")
+            .unwrap();
+        cap.state = json!({ "value": 1 });
+        assert_eq!(
+            resolve_capability_toggle_state(&device, "fanToggle"),
+            Some(true)
+        );
     }
 }

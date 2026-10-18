@@ -4,6 +4,7 @@ pub mod capability_mode;
 pub mod climate;
 pub mod cover;
 pub mod enumerator;
+pub mod fan;
 pub mod humidifier;
 pub mod instance;
 pub mod light;

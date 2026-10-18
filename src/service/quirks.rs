@@ -44,6 +44,11 @@ pub struct Quirk {
     /// this to fall back to an inferred/optimistic state rather than leaving
     /// the entity unknown forever.
     pub empty_platform_state: bool,
+    /// If true, present the device to hass as an air purifier: a fan entity
+    /// carrying power, speed (gearMode) and the remaining work modes as
+    /// presets, in place of the separate power switch and work-mode
+    /// controls that are generated from the platform capabilities.
+    pub air_purifier_fan: bool,
 }
 
 impl Quirk {
@@ -67,6 +72,7 @@ impl Quirk {
             iot_api_supported: false,
             show_as_preset_buttons: None,
             empty_platform_state: false,
+            air_purifier_fan: false,
         }
     }
 
@@ -141,6 +147,11 @@ impl Quirk {
 
     pub fn with_empty_platform_state(mut self) -> Self {
         self.empty_platform_state = true;
+        self
+    }
+
+    pub fn with_air_purifier_fan(mut self) -> Self {
+        self.air_purifier_fan = true;
         self
     }
 
@@ -316,6 +327,14 @@ fn load_quirks() -> HashMap<String, Quirk> {
             .with_brightness()
             .with_iot_api_support(true)
             .with_empty_platform_state(),
+        // Air Purifier 2 Pro. No LAN API. It reports its state over IoT, but
+        // is controlled through the platform API: the generic IoT light
+        // commands that iot_api_supported would route here act on the
+        // purifier itself, not on its nightlight.
+        Quirk::device("H7129", DeviceType::AirPurifier, "mdi:air-purifier")
+            .with_rgb()
+            .with_brightness()
+            .with_air_purifier_fan(),
         // Lights from the list of LAN API enabled devices
         // at <https://app-h5.govee.com/user-manual/wlan-guide>
         Quirk::lan_api_capable_light("H6072", FLOOR_LAMP),

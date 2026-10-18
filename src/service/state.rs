@@ -360,14 +360,18 @@ impl State {
                 )
             })?;
 
-        if let Some(lan_dev) = &device.lan_device {
+        // The LAN and generic IoT power commands switch the whole device,
+        // so they are only the light's power when the device is a light.
+        let is_main_power = instance_name == "powerSwitch";
+
+        if let Some(lan_dev) = device.lan_device.as_ref().filter(|_| is_main_power) {
             log::info!("Using LAN API to set {device} light power state");
             lan_dev.send_turn(on).await?;
             self.poll_lan_api(lan_dev, |status| status.on == on).await?;
             return Ok(());
         }
 
-        if device.iot_api_supported() {
+        if is_main_power && device.iot_api_supported() {
             if let Some(iot) = self.get_iot_client().await {
                 if let Some(info) = &device.undoc_device_info {
                     log::info!("Using IoT API to set {device} light power state");

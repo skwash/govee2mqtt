@@ -253,6 +253,34 @@ impl PacketManager {
             NotifySegmentColors::decode,
         ));
 
+        // H7129 air purifier. These arrive in every IoT status report (roughly
+        // every two minutes) and within a second of any change made from the
+        // Govee app or the buttons on the unit.
+        all_codecs.push(packet!(
+            &["H7129"],
+            NotifyPurifierWorkMode,
+            NotifyPurifierWorkMode,
+            0xaa,
+            0x05,
+            mode,
+            param,
+        ));
+        all_codecs.push(packet!(
+            &["H7129"],
+            NotifyPurifierNightlight,
+            NotifyPurifierNightlight,
+            0xaa,
+            0x1b,
+            0x01,
+            on,
+            brightness,
+        ));
+        all_codecs.push(PacketCodec::new(
+            &["H7129"],
+            NotifyPurifierNightlightEffect::encode,
+            NotifyPurifierNightlightEffect::decode,
+        ));
+
         all_codecs.push(PacketCodec::new(
             &["Generic:Light"],
             SetSceneCode::encode,
@@ -535,6 +563,67 @@ impl NotifySegmentColors {
     }
 }
 
+/// Work mode report from the H7129 air purifier (`AA 05 ...`).
+///
+/// `mode == 0` reports the active work mode, carried in `param`, using the
+/// same numbering as the platform `workMode` enum (1 gearMode, 3 Auto,
+/// 5 Sleep, 7 Turbo). Any other `mode` reports the parameter for that mode;
+/// for gearMode (1) that is the selected speed, 1-3 for Low/Medium/High.
+///
+/// The gearMode parameter is only meaningful while gearMode is active: in
+/// the other modes the unit overwrites it with the speed it is running at
+/// (4 in Sleep and quiet Auto, 5 in Turbo).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NotifyPurifierWorkMode {
+    pub mode: u8,
+    pub param: u8,
+}
+
+/// Nightlight power and brightness (1-100) from the H7129 (`AA 1B 01 ...`).
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct NotifyPurifierNightlight {
+    pub on: u8,
+    pub brightness: u8,
+}
+
+/// What the H7129 nightlight is showing (`AA 1B 05 ...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotifyPurifierNightlightEffect {
+    /// A solid color (`AA 1B 05 0D rr gg bb`).
+    Color { r: u8, g: u8, b: u8 },
+    /// A built-in scene, numbered as in the platform `nightlightScene` enum
+    /// (`AA 1B 05 13 00 nn`).
+    Scene(u8),
+    /// Neither: the default white, which is also what Sleep mode reverts the
+    /// nightlight to (`AA 1B 05 FC`).
+    Default,
+}
+
+impl NotifyPurifierNightlightEffect {
+    fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("NotifyPurifierNightlightEffect::encode is not implemented");
+    }
+
+    fn decode(data: &[u8]) -> anyhow::Result<GoveeBlePacket> {
+        anyhow::ensure!(data.len() >= 19, "expected >= 19 bytes, got {}", data.len());
+        anyhow::ensure!(
+            data[0..3] == [0xaa, 0x1b, 0x05],
+            "not an H7129 nightlight effect report"
+        );
+
+        let effect = match data[3..19] {
+            [0x0d, r, g, b, ref rest @ ..] if rest.iter().all(|&b| b == 0) => {
+                Self::Color { r, g, b }
+            }
+            [0x13, 0x00, n, ref rest @ ..] if rest.iter().all(|&b| b == 0) => Self::Scene(n),
+            [0xfc, ref rest @ ..] if rest.iter().all(|&b| b == 0) => Self::Default,
+            _ => anyhow::bail!("unknown H7129 nightlight effect {:02x?}", &data[3..19]),
+        };
+
+        Ok(GoveeBlePacket::NotifyPurifierNightlightEffect(effect))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GoveeBlePacket {
     Generic(HexBytes),
@@ -549,6 +638,9 @@ pub enum GoveeBlePacket {
     NotifyFanState(NotifyFanState),
     NotifyLightToggles(NotifyLightToggles),
     NotifySegmentColors(NotifySegmentColors),
+    NotifyPurifierWorkMode(NotifyPurifierWorkMode),
+    NotifyPurifierNightlight(NotifyPurifierNightlight),
+    NotifyPurifierNightlightEffect(NotifyPurifierNightlightEffect),
 }
 
 #[derive(Debug)]
@@ -848,6 +940,111 @@ a3 05 01 ff 05 01 c8 14 14 02 ee 14 01 00 ff 00 00 00 00 92
 a3 ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 5c
 33 05 04 d4 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 e6
 "
+        );
+    }
+
+    /// Decode a hex dump of a captured frame, so that the H7129 tests below
+    /// can quote the frames exactly as they were logged.
+    fn h7129(hex: &str) -> GoveeBlePacket {
+        let bytes: Vec<u8> = hex
+            .split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect();
+        MGR.decode_for_sku("H7129", &bytes)
+    }
+
+    /// Every frame in these tests was captured from a real H7129 over AWS
+    /// IoT while changing its settings in the Govee app and on the unit.
+    #[test]
+    fn h7129_work_mode() {
+        // Active mode: gearMode, then Auto, Sleep and Turbo.
+        for (frame, mode) in [
+            (
+                "aa 05 00 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ae",
+                1,
+            ),
+            (
+                "aa 05 00 03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ac",
+                3,
+            ),
+            (
+                "aa 05 00 05 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 aa",
+                5,
+            ),
+            (
+                "aa 05 00 07 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 a8",
+                7,
+            ),
+        ] {
+            assert_eq!(
+                h7129(frame),
+                GoveeBlePacket::NotifyPurifierWorkMode(NotifyPurifierWorkMode {
+                    mode: 0,
+                    param: mode
+                })
+            );
+        }
+
+        // gearMode speed: Medium.
+        assert_eq!(
+            h7129("aa 05 01 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 ac"),
+            GoveeBlePacket::NotifyPurifierWorkMode(NotifyPurifierWorkMode { mode: 1, param: 2 })
+        );
+
+        // The Auto mode settings carry more than one parameter; we don't
+        // know what they mean, so they must not be mistaken for a mode report.
+        assert!(matches!(
+            h7129("aa 05 03 00 00 12 00 00 00 00 00 00 00 00 00 00 00 00 00 be"),
+            GoveeBlePacket::Generic(_)
+        ));
+    }
+
+    #[test]
+    fn h7129_nightlight() {
+        assert_eq!(
+            h7129("aa 1b 01 01 14 00 00 00 00 00 00 00 00 00 00 00 00 00 00 a5"),
+            GoveeBlePacket::NotifyPurifierNightlight(NotifyPurifierNightlight {
+                on: 1,
+                brightness: 20
+            })
+        );
+        assert_eq!(
+            h7129("aa 1b 01 00 32 00 00 00 00 00 00 00 00 00 00 00 00 00 00 82"),
+            GoveeBlePacket::NotifyPurifierNightlight(NotifyPurifierNightlight {
+                on: 0,
+                brightness: 50
+            })
+        );
+    }
+
+    #[test]
+    fn h7129_nightlight_effect() {
+        assert_eq!(
+            h7129("aa 1b 05 0d ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00 46"),
+            GoveeBlePacket::NotifyPurifierNightlightEffect(NotifyPurifierNightlightEffect::Color {
+                r: 0xff,
+                g: 0,
+                b: 0
+            })
+        );
+        assert_eq!(
+            h7129("aa 1b 05 0d 00 00 ff 00 00 00 00 00 00 00 00 00 00 00 00 46"),
+            GoveeBlePacket::NotifyPurifierNightlightEffect(NotifyPurifierNightlightEffect::Color {
+                r: 0,
+                g: 0,
+                b: 0xff
+            })
+        );
+        // Scene 2 is "Ocean" in the platform nightlightScene enum.
+        assert_eq!(
+            h7129("aa 1b 05 13 00 02 00 00 00 00 00 00 00 00 00 00 00 00 00 a5"),
+            GoveeBlePacket::NotifyPurifierNightlightEffect(NotifyPurifierNightlightEffect::Scene(
+                2
+            ))
+        );
+        assert_eq!(
+            h7129("aa 1b 05 fc 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 48"),
+            GoveeBlePacket::NotifyPurifierNightlightEffect(NotifyPurifierNightlightEffect::Default)
         );
     }
 }

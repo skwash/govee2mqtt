@@ -231,6 +231,10 @@ impl GoveeApiClient {
     /// treating them as scenes as well put entries like an H1310's
     /// "Speed 1".."Speed 6" fan speeds into the light's effect list, where
     /// they do not belong and cannot be applied as a scene.
+    ///
+    /// The exception is `nightlightScene` (eg: the H7129 air purifier's
+    /// "Forest", "Ocean", ...), which is exactly what a scene is, for the
+    /// nightlight that hass shows as the device's light.
     pub fn collect_scene_caps(
         sources: &[(&str, &[DeviceCapability])],
         sku: &str,
@@ -240,10 +244,13 @@ impl GoveeApiClient {
 
         for (origin, caps) in sources {
             for cap in *caps {
-                let is_scene = matches!(
-                    cap.kind,
-                    DeviceCapabilityKind::DynamicScene | DeviceCapabilityKind::DynamicSetting
-                );
+                let is_scene = match cap.kind {
+                    DeviceCapabilityKind::DynamicScene | DeviceCapabilityKind::DynamicSetting => {
+                        true
+                    }
+                    DeviceCapabilityKind::Mode => cap.instance == "nightlightScene",
+                    _ => false,
+                };
                 if !is_scene {
                     continue;
                 }
@@ -1177,6 +1184,25 @@ mod test {
             !caps.iter().any(|c| c.instance == "fanSpeedMode"),
             "fanSpeedMode must not be treated as a scene, got {:?}",
             caps.iter().map(|c| &c.instance).collect::<Vec<_>>()
+        );
+    }
+
+    /// The H7129's nightlightScene is the nightlight's scene list, unlike
+    /// its workMode, which is driven through the fan entity.
+    #[test]
+    fn nightlight_scene_is_a_scene() {
+        let info: HttpDeviceInfo =
+            from_json(include_str!("../test-data/h7129_platform_metadata.json")).unwrap();
+
+        let caps = GoveeApiClient::collect_scene_caps(
+            &[("device.capabilities", info.capabilities.as_slice())],
+            &info.sku,
+            &info.device,
+        );
+
+        assert_eq!(
+            caps.iter().map(|c| c.instance.as_str()).collect::<Vec<_>>(),
+            vec!["nightlightScene"]
         );
     }
 

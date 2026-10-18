@@ -1,4 +1,7 @@
-use crate::ble::{Base64HexBytes, GoveeBlePacket, HumidifierAutoMode, NotifyHumidifierMode};
+use crate::ble::{
+    Base64HexBytes, GoveeBlePacket, HumidifierAutoMode, NotifyHumidifierMode,
+    NotifyPurifierNightlightEffect, NotifyPurifierWorkMode,
+};
 use crate::lan_api::{DeviceColor, DeviceStatus};
 use crate::platform_api::from_json;
 use crate::service::state::StateHandle;
@@ -341,6 +344,15 @@ struct StateUpdate {
     pub color_temperature_kelvin: Option<u32>,
     pub sku: Option<String>,
     pub device: Option<String>,
+    pub sta: Option<StaUpdate>,
+}
+
+/// Sensor readings that some devices (eg: the H7129 air purifier) report
+/// alongside their state.
+#[derive(Deserialize, Debug)]
+struct StaUpdate {
+    #[serde(rename = "rawPm25")]
+    pub raw_pm25: Option<u32>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -434,6 +446,11 @@ async fn run_iot_subscriber(
                                     state.color_temperature_kelvin = v;
                                     state.on = true;
                                 }
+                                if let Some(pm25) =
+                                    packet.state.sta.as_ref().and_then(|sta| sta.raw_pm25)
+                                {
+                                    device.set_pm25(pm25);
+                                }
 
                                 if let Some(op) = &packet.op {
                                     for cmd in &op.command {
@@ -478,6 +495,51 @@ async fn run_iot_subscriber(
                                             GoveeBlePacket::NotifySegmentColors(ref segments) => {
                                                 device.set_segment_colors(segments);
                                             }
+                                            GoveeBlePacket::NotifyPurifierWorkMode(
+                                                NotifyPurifierWorkMode { mode: 0, param },
+                                            ) => {
+                                                device.set_work_mode(param);
+                                            }
+                                            GoveeBlePacket::NotifyPurifierWorkMode(
+                                                NotifyPurifierWorkMode { mode, param },
+                                            ) => {
+                                                device.set_work_mode_param(mode, param);
+                                            }
+                                            GoveeBlePacket::NotifyPurifierNightlight(nl) => {
+                                                // The purifier itself owns `state.on`; only
+                                                // the brightness belongs to the nightlight.
+                                                state.brightness = nl.brightness;
+                                                let mut params =
+                                                    device.nightlight_state.unwrap_or_default();
+                                                params.on = nl.on != 0;
+                                                params.brightness = nl.brightness;
+                                                device.set_nightlight_state(params);
+                                            }
+                                            GoveeBlePacket::NotifyPurifierNightlightEffect(
+                                                effect,
+                                            ) => match effect {
+                                                NotifyPurifierNightlightEffect::Color {
+                                                    r,
+                                                    g,
+                                                    b,
+                                                } => {
+                                                    state.color = DeviceColor { r, g, b };
+                                                    let mut params =
+                                                        device.nightlight_state.unwrap_or_default();
+                                                    params.r = r;
+                                                    params.g = g;
+                                                    params.b = b;
+                                                    device.set_nightlight_state(params);
+                                                    device.set_active_scene(None);
+                                                }
+                                                NotifyPurifierNightlightEffect::Scene(n) => {
+                                                    let name = device.nightlight_scene_name(n);
+                                                    device.set_active_scene(name.as_deref());
+                                                }
+                                                NotifyPurifierNightlightEffect::Default => {
+                                                    device.set_active_scene(None);
+                                                }
+                                            },
                                             GoveeBlePacket::Generic(_) => {
                                                 // Ignore packets that we can't decode
                                             }

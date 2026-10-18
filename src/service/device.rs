@@ -5,7 +5,8 @@ use crate::ble::{
 use crate::commands::serve::POLL_INTERVAL;
 use crate::lan_api::{DeviceColor, DeviceStatus as LanDeviceStatus, LanDevice};
 use crate::platform_api::{
-    DeviceCapability, DeviceCapabilityState, DeviceType, HttpDeviceInfo, HttpDeviceState,
+    DeviceCapability, DeviceCapabilityState, DeviceParameters, DeviceType, HttpDeviceInfo,
+    HttpDeviceState,
 };
 use crate::service::quirks::{resolve_quirk, Quirk, BULB};
 use chrono::{DateTime, Utc};
@@ -41,8 +42,13 @@ pub struct Device {
 
     pub nightlight_state: Option<NotifyHumidifierNightlightParams>,
     pub target_humidity_percent: Option<u8>,
+    /// The active work mode and per-mode parameters as last reported over
+    /// IoT. Used by humidifiers and by air purifiers.
     pub humidifier_work_mode: Option<u8>,
     pub humidifier_param_by_mode: HashMap<u8, u8>,
+
+    /// PM2.5 in µg/m³, as last reported over IoT by an air purifier.
+    pub pm25: Option<u32>,
 
     /// H1310/H1370 fan and light state decoded from IoT notifications.
     /// These are authoritative: the platform API returns an empty string for
@@ -206,6 +212,36 @@ impl Device {
     pub fn set_humidifier_work_mode_and_param(&mut self, mode: u8, param: u8) {
         self.humidifier_work_mode.replace(mode);
         self.humidifier_param_by_mode.insert(mode, param);
+    }
+
+    /// Record the active work mode without touching its parameter, for
+    /// devices that report the two separately.
+    pub fn set_work_mode(&mut self, mode: u8) {
+        self.humidifier_work_mode.replace(mode);
+    }
+
+    pub fn set_work_mode_param(&mut self, mode: u8, param: u8) {
+        self.humidifier_param_by_mode.insert(mode, param);
+    }
+
+    pub fn set_pm25(&mut self, pm25: u32) {
+        self.pm25.replace(pm25);
+    }
+
+    /// Map a nightlight scene number, as reported over IoT, to its name in
+    /// the platform `nightlightScene` capability.
+    pub fn nightlight_scene_name(&self, value: u8) -> Option<String> {
+        let cap = self
+            .http_device_info
+            .as_ref()?
+            .capability_by_instance("nightlightScene")?;
+        match &cap.parameters {
+            Some(DeviceParameters::Enum { options }) => options
+                .iter()
+                .find(|opt| opt.value.as_u64() == Some(value.into()))
+                .map(|opt| opt.name.to_string()),
+            _ => None,
+        }
     }
 
     /// Update the LAN device information
@@ -490,6 +526,14 @@ impl Device {
             }
         }
         false
+    }
+
+    /// True when this device should be presented to hass as an air purifier
+    /// fan. See `Quirk::air_purifier_fan`.
+    pub fn is_air_purifier_fan(&self) -> bool {
+        self.resolve_quirk()
+            .map(|q| q.air_purifier_fan)
+            .unwrap_or(false)
     }
 
     /// True when the platform API reports empty strings rather than real

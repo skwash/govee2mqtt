@@ -205,7 +205,13 @@ impl DeviceLight {
 
         let name = match segment {
             Some(n) => Some(format!("Segment {:03}", n + 1)),
-            None if device_type == DeviceType::Humidifier => Some("Night Light".to_string()),
+            None if matches!(
+                device_type,
+                DeviceType::Humidifier | DeviceType::AirPurifier
+            ) =>
+            {
+                Some("Night Light".to_string())
+            }
             None => None,
         };
 

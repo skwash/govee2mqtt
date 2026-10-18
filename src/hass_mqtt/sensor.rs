@@ -115,6 +115,7 @@ impl CapabilitySensor {
         let unit_of_measurement = match instance.instance.as_str() {
             "sensorTemperature" => Some(state.get_temperature_scale().await.unit_of_measurement()),
             "sensorHumidity" => Some("%"),
+            "filterLifeTime" => Some("%"),
             _ => None,
         };
 
@@ -127,6 +128,7 @@ impl CapabilitySensor {
         let state_class = match instance.instance.as_str() {
             "sensorTemperature" => Some(StateClass::Measurement),
             "sensorHumidity" => Some(StateClass::Measurement),
+            "filterLifeTime" => Some(StateClass::Measurement),
             _ => None,
         };
 
@@ -134,6 +136,8 @@ impl CapabilitySensor {
             "sensorTemperature" => "Temperature".to_string(),
             "sensorHumidity" => "Humidity".to_string(),
             "online" => "Connected to Govee Cloud".to_string(),
+            "filterLifeTime" => "Filter Life".to_string(),
+            "airQuality" => "Air Quality".to_string(),
             _ => instance.instance.to_string(),
         };
 
@@ -212,6 +216,14 @@ impl EntityInstance for CapabilitySensor {
                         None => "".to_string(),
                     }
                 }
+                // Plain readings: publish the number rather than the
+                // `{"value": ...}` wrapper.
+                "filterLifeTime" | "airQuality" => cap
+                    .state
+                    .pointer("/value")
+                    .filter(|v| v.is_number())
+                    .map(|v| v.to_string())
+                    .unwrap_or_default(),
                 _ => cap.state.to_string(),
             };
 
@@ -222,6 +234,61 @@ impl EntityInstance for CapabilitySensor {
             instance = self.instance_name
         );
         Ok(())
+    }
+}
+
+/// PM2.5 as reported by an air purifier over IoT (`rawPm25`). The platform
+/// API only offers a coarse `airQuality` level.
+pub struct Pm25Sensor {
+    sensor: SensorConfig,
+    device_id: String,
+    state: StateHandle,
+}
+
+impl Pm25Sensor {
+    pub fn new(device: &ServiceDevice, state: &StateHandle) -> Self {
+        let unique_id = format!("sensor-{id}-pm25", id = topic_safe_id(device));
+
+        Self {
+            sensor: SensorConfig {
+                base: EntityConfig {
+                    availability_topic: availability_topic(),
+                    name: Some("PM2.5".to_string()),
+                    entity_category: None,
+                    origin: Origin::default(),
+                    device: Device::for_device(device),
+                    unique_id: unique_id.clone(),
+                    device_class: Some("pm25"),
+                    icon: None,
+                },
+                state_topic: format!("gv2mqtt/sensor/{unique_id}/state"),
+                state_class: Some(StateClass::Measurement),
+                unit_of_measurement: Some("µg/m³"),
+                json_attributes_topic: None,
+            },
+            device_id: device.id.to_string(),
+            state: state.clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl EntityInstance for Pm25Sensor {
+    async fn publish_config(&self, state: &StateHandle, client: &HassClient) -> anyhow::Result<()> {
+        self.sensor.publish(state, client).await
+    }
+
+    async fn notify_state(&self, client: &HassClient) -> anyhow::Result<()> {
+        let device = self
+            .state
+            .device_by_id(&self.device_id)
+            .await
+            .expect("device to exist");
+
+        match device.pm25 {
+            Some(pm25) => self.sensor.notify_state(client, &pm25.to_string()).await,
+            None => Ok(()),
+        }
     }
 }
 

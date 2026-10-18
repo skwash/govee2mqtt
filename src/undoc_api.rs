@@ -868,6 +868,9 @@ pub struct DeviceSettings {
     /// eg: Glide Hexa. Value is base64 encoded data
     pub shapes: Option<String>,
     pub support_ble_broad_v3: Option<bool>,
+    pub support_enc: Option<bool>,
+    /// eg: H7021, H706A
+    pub segment_count: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Clone)]

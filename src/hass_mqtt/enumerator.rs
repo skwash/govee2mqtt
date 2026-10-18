@@ -2,13 +2,16 @@ use crate::hass_mqtt::base::{Device, EntityConfig, Origin};
 use crate::hass_mqtt::button::ButtonConfig;
 use crate::hass_mqtt::capability_mode::CapabilityModeSelect;
 use crate::hass_mqtt::climate::TargetTemperatureEntity;
+use crate::hass_mqtt::fan::AirPurifierFan;
 use crate::hass_mqtt::humidifier::Humidifier;
 use crate::hass_mqtt::instance::EntityList;
 use crate::hass_mqtt::light::DeviceLight;
 use crate::hass_mqtt::number::WorkModeNumber;
 use crate::hass_mqtt::scene::SceneConfig;
 use crate::hass_mqtt::select::{SceneModeSelect, WorkModeSelect};
-use crate::hass_mqtt::sensor::{CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic};
+use crate::hass_mqtt::sensor::{
+    CapabilitySensor, DeviceStatusDiagnostic, GlobalFixedDiagnostic, Pm25Sensor,
+};
 use crate::hass_mqtt::switch::CapabilitySwitch;
 use crate::hass_mqtt::work_mode::ParsedWorkMode;
 use crate::platform_api::{DeviceCapability, DeviceCapabilityKind, DeviceType};
@@ -168,7 +171,23 @@ pub async fn enumerate_entities_for_device(
         entities.add(Humidifier::new(d, state).await?);
     }
 
-    if d.device_type() != DeviceType::Light {
+    // An air purifier fan stands in for the power switch and the work-mode
+    // controls, and its nightlight scenes are the light's effects, so the
+    // entities that would duplicate those are skipped below.
+    let as_fan = d.is_air_purifier_fan()
+        && match AirPurifierFan::new(d, state) {
+            Ok(fan) => {
+                entities.add(fan);
+                entities.add(Pm25Sensor::new(d, state));
+                true
+            }
+            Err(err) => {
+                log::warn!("Falling back to generic entities for {d}: {err:#}");
+                false
+            }
+        };
+
+    if d.device_type() != DeviceType::Light && !as_fan {
         if let Some(scenes) = SceneModeSelect::new(d, state).await? {
             entities.add(scenes);
         }
@@ -177,6 +196,9 @@ pub async fn enumerate_entities_for_device(
     if let Some(info) = &d.http_device_info {
         for cap in &info.capabilities {
             match &cap.kind {
+                DeviceCapabilityKind::Toggle | DeviceCapabilityKind::OnOff
+                    if as_fan
+                        && matches!(cap.instance.as_str(), "powerSwitch" | "nightlightToggle") => {}
                 DeviceCapabilityKind::Toggle | DeviceCapabilityKind::OnOff => {
                     entities.add(CapabilitySwitch::new(d, state, cap).await?);
                 }
@@ -185,6 +207,7 @@ pub async fn enumerate_entities_for_device(
                 | DeviceCapabilityKind::MusicSetting
                 | DeviceCapabilityKind::Event => {}
 
+                DeviceCapabilityKind::Mode if as_fan && cap.instance == "nightlightScene" => {}
                 DeviceCapabilityKind::Mode => {
                     match CapabilityModeSelect::new(d, state, cap).await {
                         Ok(select) => entities.add(select),
@@ -201,6 +224,7 @@ pub async fn enumerate_entities_for_device(
 
                 DeviceCapabilityKind::Range if cap.instance == "brightness" => {}
                 DeviceCapabilityKind::Range if cap.instance == "humidity" => {}
+                DeviceCapabilityKind::WorkMode if as_fan => {}
                 DeviceCapabilityKind::WorkMode => {
                     entities_for_work_mode(d, state, cap, entities).await?;
                 }
